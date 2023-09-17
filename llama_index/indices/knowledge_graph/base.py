@@ -23,7 +23,8 @@ from llama_index.prompts.default_prompts import DEFAULT_KG_TRIPLET_EXTRACT_PROMP
 from llama_index.schema import BaseNode, MetadataMode
 from llama_index.storage.docstore.types import RefDocInfo
 from llama_index.storage.storage_context import StorageContext
-from llama_index.utils import get_tqdm_iterable
+from llama_index.utils import get_tqdm_iterable, get_tqdm_for_multiprocessing
+from multiprocessing import Pool, cpu_count, log_to_stderr
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ class KnowledgeGraphIndex(BaseIndex[KG]):
             Defaults to 128.
         kg_triplet_extract_fn (Optional[Callable]): The function to use for
             extracting triplets. Defaults to None.
+        kg_use_multiprocessing (bool): Whether to use multiprocessing for KG
+            extraction.
+        kg_get_service_context_fn (Optional[Callable]): The function to use for
+            getting the service context. Defaults to None.
 
     """
 
@@ -64,6 +69,8 @@ class KnowledgeGraphIndex(BaseIndex[KG]):
         show_progress: bool = False,
         max_object_length: int = 128,
         kg_triplet_extract_fn: Optional[Callable] = None,
+        kg_use_multiprocessing: bool = False,
+        kg_get_service_context_fn: Optional[Callable] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize params."""
@@ -81,6 +88,8 @@ class KnowledgeGraphIndex(BaseIndex[KG]):
         )
         self._max_object_length = max_object_length
         self._kg_triplet_extract_fn = kg_triplet_extract_fn
+        self._kg_use_multiprocessing = kg_use_multiprocessing
+        self._kg_get_service_context_fn = kg_get_service_context_fn
 
         super().__init__(
             nodes=nodes,
@@ -133,6 +142,40 @@ class KnowledgeGraphIndex(BaseIndex[KG]):
         )
 
     @staticmethod
+    def _llm_extract_triplets_from_service_context(
+        service_context: ServiceContext,
+        text: str,
+        kg_triple_extract_template: BasePromptTemplate,
+        max_triplets_per_chunk: int = 10,
+        max_object_length: int = 128,
+    ) -> List[Tuple[str, str, str]]:
+        """Extract keywords from text."""
+        # retry up to 3 times
+        for i in range(3):
+            try:
+                response = service_context.llm_predictor.predict(
+                    kg_triple_extract_template,
+                    text=text,
+                    max_knowledge_triplets=max_triplets_per_chunk,
+                )
+                break
+            except Exception as e:
+                import time
+                # sleep for 1 minute if the error is openai.error.RateLimitError
+                from openai.error import RateLimitError
+                import random
+                if isinstance(e, RateLimitError):
+                    logger.error("Rate limit error, sleeping for 1 minute with exponential backoff with jitter")
+                    rand = random.uniform(0, 1)
+                    time.sleep(20 * (2 ** i) + rand)
+                    continue
+                else:
+                    raise e
+        return KnowledgeGraphIndex._parse_triplet_response(
+            response, max_length=max_object_length
+        )
+
+    @staticmethod
     def _parse_triplet_response(
         response: str, max_length: int = 128
     ) -> List[Tuple[str, str, str]]:
@@ -163,6 +206,69 @@ class KnowledgeGraphIndex(BaseIndex[KG]):
 
     def _build_index_from_nodes(self, nodes: Sequence[BaseNode]) -> KG:
         """Build the index from nodes."""
+        if self._kg_use_multiprocessing:
+            return self._build_index_from_nodes_multiprocess(nodes)
+        else:
+            return self._build_index_from_nodes_single_process(nodes)
+    
+    @staticmethod
+    def _parallel_triplet_extraction(node_info: Tuple[int, str, Callable]) -> Dict[str, List[Tuple[str, str, str]]]:
+        # Code to process a chunk of nodes and return their triplets
+        service_context = node_info[2]()
+        triplets_dict = {}
+        triplets = KnowledgeGraphIndex._llm_extract_triplets_from_service_context(
+            service_context,
+            node_info[1],
+            DEFAULT_KG_TRIPLET_EXTRACT_PROMPT,
+            10,
+            128,
+        )
+        triplets_dict[node_info[0]] = triplets
+        return triplets_dict
+    
+    def _build_index_from_nodes_multiprocess(self, nodes: Sequence[BaseNode]) -> KG:
+        """Build the index from nodes using multiprocessing."""
+        # do simple concatenation
+        index_struct = self.index_struct_cls()
+        num_workers = cpu_count() * 2
+
+        mapper = get_tqdm_for_multiprocessing(self._show_progress, "Processing nodes", max_workers=num_workers, chunksize=1)
+
+        node_texts = [(i, n.get_content(metadata_mode=MetadataMode.LLM), self._kg_get_service_context_fn) for i, n in enumerate(nodes)]
+
+        # Process in parallel
+        if mapper is not None:
+            results = mapper(self._parallel_triplet_extraction, node_texts)
+        else:
+            with Pool(processes=num_workers) as pool:
+                results = pool.map(self._parallel_triplet_extraction, node_texts, chunksize=1)
+
+        # Aggregate results
+        for triplet_dict in results:
+            for node_index, triplets in triplet_dict.items():
+                n = nodes[node_index]
+                for triplet in triplets:
+                    subj, _, obj = triplet
+                    self.upsert_triplet(triplet)
+                    index_struct.add_node([subj, obj], n)
+                if self.include_embeddings:
+                    for triplet in triplets:
+                        self._service_context.embed_model.queue_text_for_embedding(
+                            str(triplet), str(triplet)
+                        )
+
+                    embed_outputs = (
+                        self._service_context.embed_model.get_queued_text_embeddings(
+                            self._show_progress
+                        )
+                    )
+                    for rel_text, rel_embed in zip(*embed_outputs):
+                        index_struct.add_to_embedding_dict(rel_text, rel_embed)
+
+        return index_struct
+    
+    def _build_index_from_nodes_single_process(self, nodes: Sequence[BaseNode]) -> KG:
+        """Build the index from nodes using a single process."""
         # do simple concatenation
         index_struct = self.index_struct_cls()
         nodes_with_progress = get_tqdm_iterable(

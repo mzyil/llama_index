@@ -229,6 +229,21 @@ def get_tqdm_iterable(items: Iterable, show_progress: bool, desc: str) -> Iterab
             pass
     return _iterator
 
+def get_tqdm_for_multiprocessing(show_progress: bool, desc: str, max_workers: int, chunksize: int) -> Optional[Callable]:
+    """
+    Optionally get a tqdm function for multiprocessing.
+    Returns tqdm.contrib.concurrent.process_map if tqdm is present. If tqdm is
+    not installed, returns None.
+    """
+    if show_progress:
+        try:
+            from tqdm.contrib.concurrent import process_map
+
+            return partial(process_map, desc=desc, max_workers=max_workers, chunksize=chunksize)
+        except ImportError:
+            pass
+    return None
+
 
 def count_tokens(text: str) -> int:
     tokens = globals_helper.tokenizer(text)
